@@ -107,3 +107,116 @@ Processador **Intel Core i9-14900HX** (8 P-cores + 16 E-cores):
 - **L2 e L3 unificadas:** L2 de 2 MB por P-core e 4 MB por cluster de 4 E-cores; L3 de 36 MB compartilhada.
 
 **Conclusão: o computador é Von Neumann (na prática, "Harvard modificada").** A L1 separada em instruções e dados é uma característica Harvard, mas só existe **dentro** do núcleo, para buscar instrução e dado no mesmo ciclo. Do L2 para baixo a cache é unificada e a memória principal (DRAM) é **uma só**, com um único espaço de endereçamento onde código e dados convivem: um programa pode ser carregado como dado e depois executado. Esse é o modelo de Von Neumann. A L1 dividida só alivia o gargalo, não muda o modelo.
+
+---
+
+## A2. Pipeline: o loop do filtro
+
+```asm
+1 lw   x5, 0(x10)    # lê a amostra nova
+2 add  x6, x6, x5    # soma += nova
+3 lw   x7, 0(x11)    # lê a amostra mais antiga
+4 sub  x6, x6, x7    # soma -= antiga
+5 sw   x6, 0(x12)    # grava a soma
+6 addi x10, x10, 4   # avança o ponteiro da nova
+7 addi x11, x11, 4   # avança o ponteiro da antiga
+```
+
+Pipeline de 5 estágios (IF, ID, EX, MEM, WB). O banco de registradores é escrito na 1ª metade do ciclo e lido na 2ª, então uma instrução pode ler em ID, no mesmo ciclo, o valor que outra grava em WB.
+
+### A2.1 Dependências de dados (RAW)
+
+| Dependência | Produtora | Consumidora | Registrador | Tipo |
+|---|---|---|---|---|
+| D1 | 1 `lw` | 2 `add` | **x5** | load-use (distância 1) |
+| D2 | 3 `lw` | 4 `sub` | **x7** | load-use (distância 1) |
+| D3 | 2 `add` | 4 `sub` | **x6** | ALU → ALU (distância 2) |
+| D4 | 4 `sub` | 5 `sw` | **x6** | ALU → store (distância 1) |
+
+As instruções 6 e 7 não têm RAW dentro do trecho: elas **escrevem** x10/x11 depois que 1 e 3 os leram (WAR), e o `add`/`sub` escrevem ambos x6 (WAW). Num pipeline em ordem de 5 estágios, WAR e WAW não geram bolha.
+
+### A2.2 Sem forwarding
+
+Sem forwarding, a consumidora só pode fazer ID no mesmo ciclo do WB da produtora (escrita na 1ª metade, leitura na 2ª). Para instruções vizinhas isso dá **2 bolhas**. Legenda: `s` = parada (bolha); a instrução seguinte fica presa em IF enquanto a de cima está parada.
+
+| Instr. | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 lw x5 | IF | ID | EX | MEM | WB | | | | | | | | | | | | |
+| 2 add x6 | | IF | s | s | **ID** | EX | MEM | WB | | | | | | | | | |
+| 3 lw x7 | | | IF | s | s | ID | EX | MEM | WB | | | | | | | | |
+| 4 sub x6 | | | | | | IF | s | s | **ID** | EX | MEM | WB | | | | | |
+| 5 sw x6 | | | | | | | IF | s | s | s | s | **ID** | EX | MEM | WB | | |
+| 6 addi x10 | | | | | | | | | | IF | s | s | ID | EX | MEM | WB | |
+| 7 addi x11 | | | | | | | | | | | | | IF | ID | EX | MEM | WB |
+
+- 2 `add`: ID no ciclo 5, junto com o WB de 1 (x5) → 2 bolhas.
+- 4 `sub`: ID no ciclo 9, junto com o WB de 3 (x7); x6 de 2 já foi escrito no ciclo 8 → 2 bolhas.
+- 5 `sw`: ID no ciclo 12, junto com o WB de 4 (x6) → 2 bolhas.
+
+```
+Total = 5 (primeira instrução) + 6 (demais) + 6 bolhas = 17 ciclos
+CPI do trecho = 17 / 7 ≈ 2,43   (ideal → 11 / 7 ≈ 1,57)
+```
+
+**Sem forwarding: 17 ciclos** do primeiro IF (ciclo 1) ao último WB (ciclo 17).
+
+### A2.3 Com forwarding
+
+Com forwarding, o resultado de uma ALU vai de EX/MEM direto para o EX da próxima, sem bolha. O valor de um `lw` só existe **no fim do MEM**, então a instrução logo depois ainda precisa de **1 bolha** (load-use).
+
+| Instr. | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 lw x5 | IF | ID | EX | MEM | WB | | | | | | | | |
+| 2 add x6 | | IF | s | ID | **EX** | MEM | WB | | | | | | |
+| 3 lw x7 | | | IF | s | ID | EX | MEM | WB | | | | | |
+| 4 sub x6 | | | | | IF | s | ID | **EX** | MEM | WB | | | |
+| 5 sw x6 | | | | | | IF | s | ID | **EX** | MEM | WB | | |
+| 6 addi x10 | | | | | | | | IF | ID | EX | MEM | WB | |
+| 7 addi x11 | | | | | | | | | IF | ID | EX | MEM | WB |
+
+Caminhos de forwarding usados:
+- MEM/WB → EX: x5 de 1 para 2 (ciclo 5) e x7 de 3 para 4 (ciclo 8).
+- EX/MEM → EX: x6 de 4 para 5 (ciclo 9).
+- x6 de 2 para 4: 2 já gravou no ciclo 7, então 4 lê pelo banco de registradores.
+
+```
+Total = 11 + 2 bolhas = 13 ciclos   (CPI = 13 / 7 ≈ 1,86)
+```
+
+**Com forwarding: 13 ciclos.** As dependências que **ainda causam bolha** são as **load-use: D1 (1→2, x5) e D2 (3→4, x7)**. O `lw` só tem o dado no fim do estágio MEM (ciclo 4 para o 1º `lw`), mas a instrução seguinte precisaria dele no início do seu EX, que seria o mesmo ciclo 4. Forwarding não manda dado para trás no tempo, então o hardware tem que atrasar a consumidora em 1 ciclo.
+
+### A2.4 Reordenação sem bolhas
+
+A ideia é afastar cada `lw` da instrução que usa o resultado dele, subindo o segundo `lw`:
+
+```asm
+1 lw   x5, 0(x10)    # lê a amostra nova
+3 lw   x7, 0(x11)    # lê a amostra antiga   (subiu)
+2 add  x6, x6, x5    # x5 está 2 instruções atrás -> MEM/WB forwarding
+4 sub  x6, x6, x7    # x7 está 2 instruções atrás; x6 vem do add por EX/MEM
+5 sw   x6, 0(x12)    # x6 vem do sub por EX/MEM
+6 addi x10, x10, 4
+7 addi x11, x11, 4
+```
+
+O resultado não muda: os dois `lw` leem endereços que nem `add` nem `sub` alteram, a ordem `add` antes de `sub` sobre x6 continua igual, e os `addi` continuam depois dos `lw` que usam x10/x11.
+
+| Instr. | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| lw x5 | IF | ID | EX | MEM | WB | | | | | | |
+| lw x7 | | IF | ID | EX | MEM | WB | | | | | |
+| add x6 | | | IF | ID | EX | MEM | WB | | | | |
+| sub x6 | | | | IF | ID | EX | MEM | WB | | | |
+| sw x6 | | | | | IF | ID | EX | MEM | WB | | |
+| addi x10 | | | | | | IF | ID | EX | MEM | WB | |
+| addi x11 | | | | | | | IF | ID | EX | MEM | WB |
+
+```
+Total = 5 + 6 + 0 bolhas = 11 ciclos   (CPI = 11 / 7 ≈ 1,57, o mínimo para 7 instruções)
+```
+
+| Cenário | Ciclos | Bolhas |
+|---|---|---|
+| Sem forwarding | 17 | 6 |
+| Com forwarding | 13 | 2 |
+| Com forwarding + reordenação | **11** | **0** |
