@@ -282,3 +282,85 @@ stateDiagram-v2
 ```
 
 **A thread do sensor passa a maior parte do tempo em Bloqueado.** Ela acorda a cada 10 ms (interrupção do timer), dispara a leitura I2C, espera o dado (bloqueada de novo), coloca a amostra no buffer e volta a dormir até o próximo período. Mesmo o processamento inteiro da amostra leva em média 1,554 ms (A1.2), ou seja, ~15% do período. A leitura do sensor sozinha leva bem menos que isso, então em mais de 85% de cada janela de 10 ms ela fica esperando o tempo passar ou o hardware responder. Ela é uma tarefa **limitada por E/S e periódica**, não por CPU. É por isso que pode ter a prioridade mais alta sem roubar CPU das outras: quase nunca está pronta, mas quando fica pronta precisa executar na hora.
+
+---
+
+## A4. Código com semáforos: o buffer entre o sensor e o motor
+
+Código em [`codigo/`](codigo/) (Python 3 + `threading`), com buffer circular de **N = 7** posições e 20.000 amostras. Cada script roda as 3 execuções sozinho e imprime a tabela (`python versao1.py`, `python versao2.py`, `python versao3.py`; ver README).
+
+Como as métricas são calculadas (`comum.py`):
+- **Consumidas:** total de leituras feitas pelo consumidor.
+- **Perdidas:** números de 0 a 19.999 que o consumidor nunca leu.
+- **Duplicadas:** leituras de um número já lido antes (ou de uma posição nunca escrita).
+- **Travou:** o consumidor ficou 1 s sem receber nada antes do fim.
+
+Vale sempre `consumidas = (20.000 − perdidas) + duplicadas`.
+
+### Resultados (3 execuções por versão)
+
+| Versão | Exec. | Consumidas | Perdidas | Duplicadas | Travou? |
+|---|---|---|---|---|---|
+| 1 (sem sincronização) | 1 | 16.907 | 3.487 | 394 | não |
+| 1 (sem sincronização) | 2 | 18.282 | 2.266 | 548 | não |
+| 1 (sem sincronização) | 3 | 17.053 | 3.414 | 467 | não |
+| 2 (semáforos) | 1 | 20.000 | 0 | 0 | não |
+| 2 (semáforos) | 2 | 20.000 | 0 | 0 | não |
+| 2 (semáforos) | 3 | 20.000 | 0 | 0 | não |
+| 3 (ordem trocada) | 1 | 0 | 20.000 | 0 | **sim** |
+| 3 (ordem trocada) | 2 | 0 | 20.000 | 0 | **sim** |
+| 3 (ordem trocada) | 3 | 0 | 20.000 | 0 | **sim** |
+
+Na versão 1, em média **~15% das amostras se perderam** (3.056 de 20.000) e ~470 foram entregues em dobro ao motor, e os números mudam a cada execução porque dependem de quando o escalonador troca de thread. Em execuções anteriores de teste da mesma versão as perdas ficaram entre ~390 e ~3.500: o erro é real, mas imprevisível. A versão 2 foi exata nas três execuções. A versão 3 travou nas três.
+
+### Prints
+
+![Execução da versão 1](img/a4-versao1.png)
+
+![Execução da versão 2](img/a4-versao2.png)
+
+![Execução da versão 3](img/a4-versao3.png)
+
+### Região crítica da versão 1 e por que ela perde ou duplica amostras
+
+A região crítica é a **atualização do contador compartilhado `contador`** (junto com o acesso ao buffer que ela controla):
+
+```python
+# produtor                              # consumidor
+lido = estado["contador"]               lido = estado["contador"]
+time.sleep(0)    # troca de thread      time.sleep(0)    # troca de thread
+estado["contador"] = lido + 1           estado["contador"] = lido - 1
+```
+
+`contador += 1` não é atômico: são três passos (ler, calcular, escrever), e o `sleep(0)` força a troca de thread no meio. Exemplo com `contador = 3`:
+
+1. O produtor lê 3 e é interrompido.
+2. O consumidor lê 3, consome uma amostra e grava 2.
+3. O produtor volta e grava 3 + 1 = **4**. O decremento do consumidor foi apagado (*lost update*).
+
+Agora o contador diz que há **mais** amostras do que existem de verdade:
+- **Duplicação:** o consumidor confia no contador e lê posições que já leu (ou que ainda não foram reescritas), e entrega ao motor uma amostra repetida.
+- **Perda:** no caso oposto, quando um incremento do produtor é apagado, o contador fica **menor** que o real. O produtor acha que há espaço e sobrescreve uma posição que o consumidor ainda não leu, e essa amostra some.
+
+Na pulseira, uma amostra perdida é um poste que não vibrou, e uma duplicada é uma vibração com uma distância velha. A espera ocupada ainda gasta CPU à toa enquanto espera.
+
+### O que cada semáforo garante na versão 2
+
+| Semáforo | Valor inicial | Quem dá `wait` / `signal` | O que garante |
+|---|---|---|---|
+| `vazio` | N = 7 | produtor `wait` antes de escrever; consumidor `signal` depois de ler | O produtor **nunca escreve com o buffer cheio**: ele dorme quando as 7 posições estão ocupadas, então nada é sobrescrito antes de ser lido (**sem perdas**). |
+| `cheio` | 0 | consumidor `wait` antes de ler; produtor `signal` depois de escrever | O consumidor **nunca lê com o buffer vazio**: ele dorme até existir uma amostra nova, então nada é lido duas vezes (**sem duplicadas**). |
+| `mutex` | 1 | as duas threads, em volta do acesso ao buffer e aos índices | **Exclusão mútua**: só uma thread por vez mexe no buffer e nos índices, e a região crítica fica atômica. |
+
+Os contadores de `vazio` e `cheio` são atualizados atomicamente pelo próprio semáforo, o que substitui o `contador` vulnerável da versão 1. Como as threads dormem em vez de girar, também acaba a espera ocupada.
+
+### O que aconteceu na versão 3, e por quê
+
+As três execuções **travaram com 0 amostras consumidas**: um **deadlock**.
+
+1. O produtor começa antes e preenche as 7 posições. A cada amostra ele pega e solta o `mutex`, e `vazio` cai de 7 para 0.
+2. Na 8ª amostra ele faz `wait(mutex)` (consegue) e depois `wait(vazio)`. Como `vazio = 0`, ele **dorme segurando o mutex**.
+3. O consumidor faz `wait(cheio)` (consegue, `cheio = 7`) e depois `wait(mutex)`, e **bloqueia**, porque o mutex está com o produtor.
+4. O produtor espera um `signal(vazio)` que só o consumidor pode dar, e o consumidor espera um `signal(mutex)` que só o produtor pode dar. Ninguém avança, e após 1 s o consumidor registra travamento.
+
+As quatro condições de Coffman aparecem: exclusão mútua (mutex), posse e espera (o produtor segura o mutex enquanto espera `vazio`), sem preempção (ninguém tira o mutex do produtor) e espera circular (produtor → consumidor → produtor). A regra que a versão 2 segue é **nunca dormir num semáforo de contagem segurando o mutex**: primeiro garanta que há recurso (`vazio`/`cheio`), depois entre na região crítica. Trocar duas linhas de lugar faz a pulseira congelar.
