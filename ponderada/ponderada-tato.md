@@ -220,3 +220,65 @@ Total = 5 + 6 + 0 bolhas = 11 ciclos   (CPI = 11 / 7 ≈ 1,57, o mínimo para 7 
 | Sem forwarding | 17 | 6 |
 | Com forwarding | 13 | 2 |
 | Com forwarding + reordenação | **11** | **0** |
+
+---
+
+## A3. Processos e threads: como organizar o software (Plataforma V)
+
+### A3.1 Organização proposta
+
+```
+┌──────────── Processo 1: "tato-core" (tempo real, SCHED_FIFO, memória travada com mlock) ────────────┐
+│  thread_sensor  ──►  buffer circular (N = 7)  ──►  thread_processa  ──►  thread_motor              │
+│        (prioridade mais alta)          memória compartilhada, semáforos                             │
+└────────────────────────────────────────────┬─────────────────────────────────────────────────────────┘
+                                             │ IPC: fila de mensagens / socket Unix, não bloqueante
+                                             │ (core → BLE: log; BLE → core: comandos validados)
+┌────────────────────────────────────────────┴─────────────┐
+│  Processo 2: "tato-ble" (prioridade normal, sem root)     │
+│  fala com o celular: envia o log, recebe configuração      │
+└───────────────────────────────────────────────────────────┘
+```
+
+| Tarefa | Vira | Por quê |
+|---|---|---|
+| Ler o sensor | **thread** do processo `tato-core` | Gera uma amostra a cada 10 ms que precisa chegar ao processamento sem cópia. |
+| Processar a amostra | **thread** do `tato-core` | Lê direto o buffer compartilhado. Está no caminho crítico dos 5 ms. |
+| Acionar o motor | **thread** do `tato-core` | Recebe o resultado do processamento logo em seguida, também no caminho crítico. |
+| BLE (log + comandos) | **processo separado** `tato-ble` | Não é crítico em tempo, fala com o mundo externo e pode falhar sem derrubar a vibração. |
+
+Justificativa pelos três critérios:
+
+1. **Compartilhamento de memória.** Sensor, processamento e motor trocam 100 amostras/s. Como threads, elas dividem o mesmo espaço de endereçamento e passam a amostra pelo buffer circular sem copiar nem fazer chamada de sistema. Entre processos, cada amostra exigiria IPC (cópia + syscall + troca de contexto) dentro de um orçamento em que o pior caso da A1 já é 4,554 ms de 5 ms. O BLE só precisa de um resumo do log de vez em quando, e IPC é barato nessa frequência.
+2. **Custo de criação e troca de contexto.** Criar e trocar entre threads é mais barato que entre processos: não troca tabela de páginas e não invalida a TLB, o que também preserva a cache L1 (m = 6% já custa CPI 10,36, e mais faltas pioram). As três threads do caminho crítico trocam de contexto centenas de vezes por segundo, então esse custo importa. O BLE troca bem menos.
+3. **Isolamento de falhas.** Threads do mesmo processo caem juntas: um ponteiro inválido em qualquer uma mata as outras. O caminho crítico é código nosso, pequeno e testável, e por isso pode ficar junto. O BLE tem pilha complexa, recebe dados externos e é o código mais provável de falhar. Como processo separado, se ele cair a pulseira **continua vibrando**, só para de enviar o log, e um supervisor (systemd) o reinicia.
+
+### A3.2 BLE como thread × como processo (se alguém explorar uma falha nele)
+
+- **Como thread** dentro do `tato-core`: o atacante que executa código no BLE herda **o mesmo espaço de memória** das outras threads. Ele pode ler e alterar o buffer de amostras, mudar o limiar de distância, desligar o motor (a pessoa anda sem aviso de obstáculo) ou travar o mutex do buffer e causar um deadlock. Também herda todos os privilégios do processo de tempo real, que precisa de permissões altas para SCHED_FIFO e acesso a I2C/GPIO. Um bug no BLE vira um ataque ao sistema que mantém a pessoa segura.
+- **Como processo separado:** o SO isola os espaços de endereçamento, então o atacante fica preso no `tato-ble`. Esse processo pode rodar sem root, com seccomp/AppArmor e sem acesso a I2C ou GPIO. O único caminho até o núcleo é o canal de IPC, onde o `tato-core` **valida cada comando** (formato, faixa de valores). O pior caso passa a ser perder o log ou mandar comandos que o núcleo recusa, e o motor continua funcionando.
+
+### A3.3 Diagrama de estados de um processo
+
+```mermaid
+stateDiagram-v2
+    [*] --> Novo
+    Novo --> Pronto: admitido pelo SO
+    Pronto --> Executando: escalonador despacha
+    Executando --> Pronto: preempção / fim do quantum
+    Executando --> Bloqueado: espera E/S, timer ou semáforo
+    Bloqueado --> Pronto: evento ocorre (interrupção do timer, I2C pronto, signal)
+    Executando --> Terminado: exit
+    Terminado --> [*]
+```
+
+```
+            admitido              despachado
+  [Novo] ───────────► [Pronto] ◄────────────► [Executando] ───exit──► [Terminado]
+                         ▲        preempção         │
+                         │                          │ espera timer / I2C / semáforo
+                         │   evento ocorre          ▼
+                         └─────────────────── [Bloqueado]
+```
+
+**A thread do sensor passa a maior parte do tempo em Bloqueado.** Ela acorda a cada 10 ms (interrupção do timer), dispara a leitura I2C, espera o dado (bloqueada de novo), coloca a amostra no buffer e volta a dormir até o próximo período. Mesmo o processamento inteiro da amostra leva em média 1,554 ms (A1.2), ou seja, ~15% do período. A leitura do sensor sozinha leva bem menos que isso, então em mais de 85% de cada janela de 10 ms ela fica esperando o tempo passar ou o hardware responder. Ela é uma tarefa **limitada por E/S e periódica**, não por CPU. É por isso que pode ter a prioridade mais alta sem roubar CPU das outras: quase nunca está pronta, mas quando fica pronta precisa executar na hora.
