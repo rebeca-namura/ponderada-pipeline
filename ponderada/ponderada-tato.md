@@ -364,3 +364,97 @@ As três execuções **travaram com 0 amostras consumidas**: um **deadlock**.
 4. O produtor espera um `signal(vazio)` que só o consumidor pode dar, e o consumidor espera um `signal(mutex)` que só o produtor pode dar. Ninguém avança, e após 1 s o consumidor registra travamento.
 
 As quatro condições de Coffman aparecem: exclusão mútua (mutex), posse e espera (o produtor segura o mutex enquanto espera `vazio`), sem preempção (ninguém tira o mutex do produtor) e espera circular (produtor → consumidor → produtor). A regra que a versão 2 segue é **nunca dormir num semáforo de contagem segurando o mutex**: primeiro garanta que há recurso (`vazio`/`cheio`), depois entre na região crítica. Trocar duas linhas de lugar faz a pulseira congelar.
+
+---
+
+## A5. Deadlock: a pulseira congelou
+
+```
+thread_sensor:        thread_log:          thread_config:
+  P(i2c)                P(log)               P(ble)
+  le_sensor()           le_log()             recebe_comando()
+  P(log)                P(ble)               P(i2c)
+  registra()            envia()              ajusta_sensor()
+  V(log)                V(ble)               V(i2c)
+  V(i2c)                V(log)               V(ble)
+```
+
+### A5.1 Sequência que leva ao deadlock e grafo de alocação
+
+| Passo | Thread | Operação | i2c | log | ble |
+|---|---|---|---|---|---|
+| 1 | thread_sensor | `P(i2c)` ✔, executa `le_sensor()` | sensor | livre | livre |
+| 2 | *(troca de contexto)* thread_log | `P(log)` ✔, executa `le_log()` | sensor | log | livre |
+| 3 | *(troca de contexto)* thread_config | `P(ble)` ✔, executa `recebe_comando()` | sensor | log | config |
+| 4 | thread_sensor | `P(log)` ✖ → **bloqueia** (log está com thread_log) | sensor | log | config |
+| 5 | thread_log | `P(ble)` ✖ → **bloqueia** (ble está com thread_config) | sensor | log | config |
+| 6 | thread_config | `P(i2c)` ✖ → **bloqueia** (i2c está com thread_sensor) | sensor | log | config |
+
+Depois do passo 6 as três threads estão em Bloqueado e nenhuma vai dar `V`: **deadlock**. Sem a thread_sensor, nenhuma amostra nova é lida e o motor para. Só o desligamento físico libera os semáforos.
+
+**Grafo de alocação de recursos** (círculo = thread, quadrado = recurso; recurso → thread = alocado; thread → recurso = pedido):
+
+```mermaid
+graph LR
+    S((thread_sensor))
+    L((thread_log))
+    C((thread_config))
+    I2C[i2c]
+    LOG[log]
+    BLE[ble]
+    I2C -- alocado --> S
+    S -. pede .-> LOG
+    LOG -- alocado --> L
+    L -. pede .-> BLE
+    BLE -- alocado --> C
+    C -. pede .-> I2C
+```
+
+```
+        alocado              pede
+  [i2c] ───────► (sensor) ┄┄┄┄┄┄┄► [log]
+    ▲                                 │ alocado
+    ┊ pede                            ▼
+ (config) ◄─────── [ble] ◄┄┄┄┄┄┄┄ (log)
+           alocado          pede
+```
+
+Ciclo: sensor → log → thread_log → ble → config → i2c → sensor. Cada recurso tem uma única instância, então **ciclo no grafo = deadlock**.
+
+### A5.2 As quatro condições necessárias no código
+
+| Condição | Onde aparece |
+|---|---|
+| **Exclusão mútua** | `i2c`, `log` e `ble` são semáforos binários (iniciam em 1): só uma thread usa o barramento, o arquivo ou o rádio por vez. |
+| **Posse e espera** (*hold and wait*) | Cada thread faz o segundo `P` **sem soltar** o primeiro: o sensor segura `i2c` enquanto pede `log`, o log segura `log` enquanto pede `ble`, o config segura `ble` enquanto pede `i2c`. |
+| **Sem preempção** | Um `P` bloqueado espera para sempre (sem timeout), e o SO não tira um semáforo de quem o possui. Só a própria thread pode dar `V`. |
+| **Espera circular** | Cada thread pede os recursos em uma ordem diferente: sensor (i2c → log), log (log → ble), config (ble → i2c). Isso forma o ciclo i2c → log → ble → i2c. |
+
+Basta quebrar **uma** delas para o deadlock ficar impossível.
+
+### A5.3 Duas correções de tipos diferentes
+
+**Correção 1: prevenção, por ordenação global de recursos (quebra a espera circular).**
+Define-se uma ordem fixa, por exemplo **i2c (1) < log (2) < ble (3)**, e toda thread pede os recursos em ordem crescente:
+
+```
+thread_sensor:  P(i2c) ... P(log) ... V(log) V(i2c)      (já estava em ordem)
+thread_log:     P(log) ... P(ble) ... V(ble) V(log)      (já estava em ordem)
+thread_config:  P(i2c) P(ble) recebe_comando() ajusta_sensor() V(ble) V(i2c)   ← muda
+```
+
+Só a `thread_config` muda: ela pega o `i2c` **antes** do `ble`. Com todas subindo a mesma "escada", nenhuma pode segurar um recurso maior e esperar um menor, e o ciclo não pode se formar.
+*Para quem usa a pulseira:* o congelamento **deixa de existir**. O custo é que, enquanto a pulseira recebe um comando do celular, ela já segura o barramento I2C, então a leitura do sensor pode atrasar alguns milissegundos durante uma reconfiguração. Isso é mitigado limitando o tempo de `recebe_comando()` ou recebendo o comando antes de pegar os dois recursos. No uso normal, a pessoa não percebe nada.
+
+**Correção 2: detecção e recuperação, com watchdog e timeout.**
+Os `P` passam a ter timeout (por exemplo, `P(log, 20 ms)`) e um **watchdog de hardware** precisa ser "alimentado" pela thread_sensor a cada amostra. Se o `P` estourar o timeout, a thread solta o que tem, registra o evento e tenta de novo (recuperação por *rollback*, que quebra a posse e espera). Se ainda assim a thread_sensor passar, por exemplo, 50 ms sem alimentar o watchdog, ele **reinicia** o sistema sozinho e manda um pulso longo de aviso.
+*Para quem usa a pulseira:* o deadlock **ainda pode acontecer**, mas não fica eterno. Em vez de congelar até alguém desligar e ligar, a pessoa sente um pulso longo e fica alguns segundos sem vibração enquanto a pulseira reinicia (~4 s no caso do watchdog), ou só perde algumas amostras se o timeout resolver antes. Continua sendo uma janela cega, mas ela é curta, avisada e não depende de a pessoa perceber que a pulseira travou.
+
+| | Prevenção (ordem global) | Detecção + recuperação (timeout/watchdog) |
+|---|---|---|
+| Deadlock pode ocorrer? | Não | Sim, mas é resolvido sozinho |
+| Efeito para o usuário | Nenhum no uso normal | Pulso longo + alguns segundos sem vibração |
+| Custo de engenharia | Reescrever a thread_config e testar | Adicionar timeout + watchdog (rápido) |
+| Papel ideal | Correção definitiva | Rede de segurança contra bugs que ainda não conhecemos |
+
+Na prática, eu faria as duas: a ordenação elimina **este** deadlock, e o watchdog protege contra o próximo bug.
