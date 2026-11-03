@@ -458,3 +458,25 @@ Os `P` passam a ter timeout (por exemplo, `P(log, 20 ms)`) e um **watchdog de ha
 | Papel ideal | Correção definitiva | Rede de segurança contra bugs que ainda não conhecemos |
 
 Na prática, eu faria as duas: a ordenação elimina **este** deadlock, e o watchdog protege contra o próximo bug.
+
+---
+
+# Parte B: a decisão do CTO
+
+## Memorando ao conselho da Tato (Dilema 3: o parceiro grande)
+
+**Para:** Conselho da Tato · **De:** Rebeca Sbroglio, CTO · **Assunto:** módulo de navegação do parceiro
+
+**Decisão: o módulo do parceiro vai rodar como processo separado, e não como thread no processo principal, mesmo que isso custe o acordo.** Para reduzir a latência que preocupa o parceiro, ofereço a ele uma área de memória compartilhada **somente leitura** com as amostras, mas não aceito dar acesso de escrita ao núcleo da pulseira.
+
+**Do que estou abrindo mão.** Posso perder a distribuição para 50 mil usuários, o maior canal de crescimento que temos hoje. Se o parceiro desistir, quem paga é a empresa, com receita e escala adiadas, e os usuários que ganhariam navegação por voz. Também aceitamos engenharia extra: o canal de IPC, a validação de mensagens e um árbitro de vibração.
+
+**Os números da Parte A que pesaram:**
+- **Folga de 0,446 ms.** Na Plataforma V, o pior caso por amostra é **4,554 ms de 5 ms** (A1.2). Uma thread fechada dentro do processo disputa a mesma CPU e a mesma cache: se ela elevar a taxa de falta de 6% para 7%, o CPI efetivo vai de 10,36 para 11,92 e o pior caso para **4,79 ms**. Com 8%, chega a **5,02 ms**, e a pulseira passa a falhar o requisito sem nenhuma linha de código nossa mudar. Como processo separado, ele roda com prioridade menor que o nosso processo de tempo real e não consegue tirar a CPU dele.
+- **15% de amostras perdidas.** Na A4, duas threads acessando memória compartilhada sem a sincronização certa perderam **~3.000 de 20.000 amostras** (versão 1), e trocar duas linhas de lugar travou tudo (versão 3). Com o parceiro como thread, um erro desse tipo no código dele, que não podemos ler, vira um poste que não vibrou ou uma pulseira congelada, como na A5.
+
+**Impacto em quem usa a pulseira.** A latência extra do IPC no Linux fica na ordem de dezenas de microssegundos por mensagem. Isso é irrelevante para um aviso como "vire à direita em 20 m": a pessoa anda ~1,4 m/s e leva mais de 10 s para percorrer 20 m. Com a memória somente leitura, o parceiro lê as amostras sem cópia. O ganho é que, se o módulo de navegação travar ou cair, **a vibração de obstáculo continua funcionando**. Um árbitro no núcleo dá sempre prioridade ao aviso de obstáculo sobre o de navegação.
+
+**Risco de segurança da opção escolhida.** O canal de IPC vira uma superfície de ataque: um módulo comprometido pode mandar mensagens malformadas ou em excesso. Mitigação: o núcleo valida formato e frequência de cada mensagem, o processo do parceiro roda sem root, com seccomp e sem acesso a I2C/GPIO, e só enxerga a memória de amostras para leitura. No pior caso, um invasor no módulo do parceiro consegue dar instruções de navegação erradas, mas não consegue desligar o alerta de obstáculo. Como thread, ele poderia.
+
+**O que me faria mudar de ideia.** Aceito rodar como thread se três condições forem cumpridas juntas: (1) o parceiro entregar o código-fonte para auditoria nossa; (2) um teste de bancada de 72 h (~26 milhões de amostras) com o módulo dentro do processo mostrar **pior caso ≤ 4,0 ms** (folga de pelo menos 1 ms) e **zero amostras perdidas**; e (3) o contrato colocar sobre o parceiro a responsabilidade por falhas causadas pelo módulo dele. Sem isso, o risco recai sobre a pessoa que está andando na rua, e esse custo eu não aceito transferir.
