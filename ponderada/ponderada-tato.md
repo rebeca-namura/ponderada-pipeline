@@ -301,9 +301,9 @@ Vale sempre `consumidas = (20.000 − perdidas) + duplicadas`.
 
 | Versão | Exec. | Consumidas | Perdidas | Duplicadas | Travou? |
 |---|---|---|---|---|---|
-| 1 (sem sincronização) | 1 | 16.907 | 3.487 | 394 | não |
-| 1 (sem sincronização) | 2 | 18.282 | 2.266 | 548 | não |
-| 1 (sem sincronização) | 3 | 17.053 | 3.414 | 467 | não |
+| 1 (sem sincronização) | 1 | 16.864 | 3.672 | 536 | não |
+| 1 (sem sincronização) | 2 | 18.104 | 2.559 | 663 | não |
+| 1 (sem sincronização) | 3 | 17.010 | 3.596 | 606 | não |
 | 2 (semáforos) | 1 | 20.000 | 0 | 0 | não |
 | 2 (semáforos) | 2 | 20.000 | 0 | 0 | não |
 | 2 (semáforos) | 3 | 20.000 | 0 | 0 | não |
@@ -311,7 +311,7 @@ Vale sempre `consumidas = (20.000 − perdidas) + duplicadas`.
 | 3 (ordem trocada) | 2 | 0 | 20.000 | 0 | **sim** |
 | 3 (ordem trocada) | 3 | 0 | 20.000 | 0 | **sim** |
 
-Na versão 1, em média **~15% das amostras se perderam** (3.056 de 20.000) e ~470 foram entregues em dobro ao motor, e os números mudam a cada execução porque dependem de quando o escalonador troca de thread. Em execuções anteriores de teste da mesma versão as perdas ficaram entre ~390 e ~3.500: o erro é real, mas imprevisível. A versão 2 foi exata nas três execuções. A versão 3 travou nas três.
+Na versão 1, em média **~16% das amostras se perderam** (3.276 de 20.000) e ~600 foram entregues em dobro ao motor, e os números mudam a cada execução porque dependem de quando o escalonador troca de thread. Em execuções anteriores de teste da mesma versão as perdas ficaram entre ~390 e ~3.700: o erro é real, mas imprevisível. A versão 2 foi exata nas três execuções. A versão 3 travou nas três.
 
 ### Prints
 
@@ -473,7 +473,7 @@ Na prática, eu faria as duas: a ordenação elimina **este** deadlock, e o watc
 
 **Os números da Parte A que pesaram:**
 - **Folga de 0,446 ms.** Na Plataforma V, o pior caso por amostra é **4,554 ms de 5 ms** (A1.2). Uma thread fechada dentro do processo disputa a mesma CPU e a mesma cache: se ela elevar a taxa de falta de 6% para 7%, o CPI efetivo vai de 10,36 para 11,92 e o pior caso para **4,79 ms**. Com 8%, chega a **5,02 ms**, e a pulseira passa a falhar o requisito sem nenhuma linha de código nossa mudar. Como processo separado, ele roda com prioridade menor que o nosso processo de tempo real e não consegue tirar a CPU dele.
-- **15% de amostras perdidas.** Na A4, duas threads acessando memória compartilhada sem a sincronização certa perderam **~3.000 de 20.000 amostras** (versão 1), e trocar duas linhas de lugar travou tudo (versão 3). Com o parceiro como thread, um erro desse tipo no código dele, que não podemos ler, vira um poste que não vibrou ou uma pulseira congelada, como na A5.
+- **16% de amostras perdidas.** Na A4, duas threads acessando memória compartilhada sem a sincronização certa perderam **~3.300 de 20.000 amostras** (versão 1), e trocar duas linhas de lugar travou tudo (versão 3). Com o parceiro como thread, um erro desse tipo no código dele, que não podemos ler, vira um poste que não vibrou ou uma pulseira congelada, como na A5.
 
 **Impacto em quem usa a pulseira.** A latência extra do IPC no Linux fica na ordem de dezenas de microssegundos por mensagem. Isso é irrelevante para um aviso como "vire à direita em 20 m": a pessoa anda ~1,4 m/s e leva mais de 10 s para percorrer 20 m. Com a memória somente leitura, o parceiro lê as amostras sem cópia. O ganho é que, se o módulo de navegação travar ou cair, **a vibração de obstáculo continua funcionando**. Um árbitro no núcleo dá sempre prioridade ao aviso de obstáculo sobre o de navegação.
 
