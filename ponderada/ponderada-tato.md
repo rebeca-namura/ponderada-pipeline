@@ -99,7 +99,7 @@ Na H, a SRAM é interna e responde em 1 ciclo, e a arquitetura Harvard tem barra
 
 ![Caches do meu processador](img/a1-caches.png)
 
-> Capturado no Windows 11 com um script Python que chama `GetLogicalProcessorInformationEx` (a mesma fonte de dados que o CPU-Z usa na aba Caches).
+> Print do CPU-Z 3.02 no Windows 11. Nesta versão as informações de cache aparecem no quadro **Cache** da aba CPU: `L1 Data 8 x 48 KB + 16 x 32 KB`, `L1 Inst. 8 x 32 KB + 16 x 64 KB`, `Level 2 8 x 2 MB + 4 x 4 MB`, `Level 3 36 MBytes`.
 
 Processador **Intel Core i9-14900HX** (8 P-cores + 16 E-cores):
 
